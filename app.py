@@ -14,8 +14,9 @@ from memory import (
     MemorySystem,
     ReflectionManager,
     UpdateManager,
+    assign_event_for_units
 )
-from utils import load_bgem3, embed_text, clean_stream
+from utils import load_bgem3, embed_text, clean_stream, _cos
 
 
 @st.cache_resource
@@ -28,7 +29,7 @@ bgem3 = get_bgem3()
 # ================== Streamlit UI 配置 ==================
 st.set_page_config(page_title="🍝yuxi's LLM长时记忆实验", layout="wide")
 st.title("🍝yuxi's LLM长时记忆实验")
-st.caption("先做个小垃圾")
+# st.caption("先做个小垃圾")
 stream_mode = True
 
 
@@ -80,6 +81,7 @@ forgetter: ForgettingManager = st.session_state.forgetter
 reflecter: ReflectionManager = st.session_state.reflecter
 memory_system: MemorySystem = st.session_state.memory_system
 updater: UpdateManager = st.session_state.updater
+retrieval_manager: RetrievalManager = st.session_state.retriever
 
 # ================== Sidebar 配置（写回 retriever） ==================
 with st.sidebar:
@@ -88,52 +90,20 @@ with st.sidebar:
     # 设置检索方法
     retrieval_method = st.selectbox(
         "记忆检索方法",
-        ["Vector Search", "BM25 (Keyword)", "Hybrid Search"],
-        help="选择从记忆库中检索信息时使用的方法。",
+        ["Hybrid (DB recall + Python rerank)", "fusion", "Python (legacy cosine)"],
+        help="Hybrid 推荐：DB 先取候选，再用 Python 精确余弦重排。"
     )
 
-    # 设置 Top-K 数量
-    top_k = st.slider("Top-K 记忆", 1, 10, 3, help="单次检索返回最相关的记忆数量。")
-
-    # 设置 provider 和 model 配置
-    provider = st.selectbox(
-        "Provider",
-        ["deepseek", "ollama"],
-        index=0 if st.session_state.get("provider", "deepseek") == "deepseek" else 1,
-    )
-    st.session_state.provider = provider
-
-    model_name = st.text_input(
-        "Model",
-        value=(
-            st.session_state.get("model_name", "deepseek-chat")
-            if provider == "deepseek"
-            else "qwen2.5:14b"  # qwen2.5:14b
-        ),
-        help="deepseek 如 deepseek-chat；ollama 如 llama3 / qwen2.5 等本地模型名",
-    )
-    st.session_state.model_name = model_name
-
-    # 设置历史对话轮数
-    recent_k = st.slider(
-        "历史对话轮数 k", 0, 10, 3, help="取最近 k 轮（user↔assistant）作为历史上下文"
-    )
-    st.session_state.recent_k = recent_k
-
-    # 选择 MemoryManager
-    retrieval_manager = RetrievalManager()
-
-    # 根据选择的检索方法，调用对应的检索函数
-    if retrieval_method == "Vector Search":
-        retriever = (
-            retrieval_manager.retrieve_by_embedding
-        )  # 这里可以扩展实际的 vector 搜索实现
+    if retrieval_method.startswith("fusion"):
+        retriever = retrieval_manager.retrieve_by_fusion  # 现有 DB 版
+    elif retrieval_method.startswith("Python"):
+        retriever = retrieval_manager.retrieve_by_embedding_python  # 旧版 Python 余弦
     else:
-        pass  # "Hybrid Search" 可以组合两种方法，简单示例
+        retriever = retrieval_manager.retrieve_by_embedding_DB_python  # 新增 Hybrid
 
     # 设置检索配置
-    st.session_state.top_k = top_k
-    st.session_state.retriever = retriever
+    # st.session_state.top_k = top_k
+    # st.session_state.retriever = retriever
     st.divider()
     st.header("📚 记忆库视图")
     mem_view_mode = st.radio(
@@ -172,7 +142,7 @@ with st.sidebar:
                     "timestamp": _ts_iso(getattr(m, "timestamp", None)),
                     "importance": getattr(m, "importance", 0.0),
                     "retrieval_count": getattr(m, "retrieval_count", 0),
-                    "last_retrieved_ts": _ts_iso(getattr(m, "last_retrieved_ts", None)),
+                    "last_accessed_ts": _ts_iso(getattr(m, "last_accessed_ts", None)),
                 }
             )
         return json.dumps({"memories": data}, ensure_ascii=False, indent=2).encode(
@@ -306,7 +276,7 @@ if prompt := st.chat_input("请输入"):
     if st.session_state.get("to_generate") and (
     st.session_state.get("turn_id") != st.session_state.get("handled_turn_id")
 ):
-        prompt_embedding = embed_text(bgem3, prompt).tolist()
+        prompt_embedding = embed_text(bgem3, f"query:{prompt}").tolist()
 
         with st.chat_message("assistant", avatar="🤡"):
             # 1) 检索记忆
@@ -317,18 +287,26 @@ if prompt := st.chat_input("请输入"):
                     or []
                 )
 
-                for mem in retrieved_memories:
-                    memory_store.update_retrieval_stats(mem.id, 1)
+                expanded_mems = []
+                for m in retrieved_memories:
+                    expanded_mems.append(m)
+                    header, sibs = memory_store.get_event_context(m.id, k_siblings=5)
+                    expanded_mems.extend(sibs)
 
                 with st.expander("🔍 本轮检索到的记忆"):
-                    if retrieved_memories:
-                        for mem in retrieved_memories:
-                            st.info(
-                                f"**内容:** {mem.content}\n\n"
-                                f"**检索次数:** {mem.retrieval_count}"
-                            )
+                    if expanded_mems:
+                        for mem in expanded_mems:
+                            st.info(f"**内容:** {mem.content}\n\n**检索次数:** {mem.retrieval_count}")
+                            # ⬇️ 新增：显示所属事件与兄弟记忆
+                            header, siblings = memory_store.get_event_context(mem.id, k_siblings=3)
+                            if header:
+                                st.caption(f"事件：《{header.get('title') or '未命名事件'}》"
+                                        f"｜状态：{header.get('status')}｜时间窗：{header.get('start_ts')} → {header.get('updated_at')}")
+                                for s in siblings:
+                                    st.write(f"· 兄弟：{s.content}（imp={getattr(s,'importance',0):.2f}）")
                     else:
                         st.warning("未检索到相关记忆。")
+
 
             # 2) 生成回复
             st.caption(
@@ -351,53 +329,97 @@ if prompt := st.chat_input("请输入"):
                     provider=st.session_state.provider,
                     model=st.session_state.model_name,
                     recent_dialog=recent_dialog,
-                    retrieved_memories=retrieved_memories,
+                    retrieved_memories=expanded_mems,
                     current_query=prompt,
                     stream=stream_mode,  
                 )
 
                 cleaned_stream = clean_stream(assistant_response_stream)
                 full_text = st.write_stream(cleaned_stream)
-                print(f"yuxi see full_text:\n{full_text}")
 
                 st.session_state.messages.append(
                     {"role": "assistant", "content": full_text}
                 )
 
             # 3) 更新记忆
-            # 3.1 组织原始对话文本（只拿本轮：用户输入 + 助手回答）
-            print(f"yuxi see:\n full text:{full_text}")
-            raw_for_memory = f"User: {prompt},\nAssistant: {full_text}"
+            # 3.1 组织原始对话文本（只拿本轮：用户输入）
+            raw_for_memory = f"User: {prompt}"
 
             # 3.2 调用提取器（DeepSeek），返回 MemoryUnit 列表（已自带 importance 与 embedding）
             updater: UpdateManager = st.session_state.updater
             try:
                 with st.spinner("正在从本轮对话中提取记忆…"):
                     new_units = updater.build_memories_from_raw(raw_for_memory)  # -> List[MemoryUnit]
+                    # —— 调试：展示 LLM 原始返回 / 模型文本 / 被解析 JSON —— debug
+                    with st.expander("🧪 记忆提取调试（LLM 原始返回）", expanded=False):
+                        # st.caption("last_http_json（HTTP 原始 JSON，前 20KB）：")
+                        # if getattr(updater, "last_http_json", None):
+                        #     st.code(updater.last_http_json, language="json")
+                        # else:
+                        #     st.write("（空）")
+
+                        # st.caption("last_model_text（模型文本，去掉 ``` 围栏后）：")
+                        # if getattr(updater, "last_model_text", None):
+                        #     st.code(updater.last_model_text, language="json")
+                        # else:
+                        #     st.write("（空）")
+
+                        st.caption("last_parsed_json（用于 json.loads 的数组字符串）：")
+                        if getattr(updater, "last_parsed_json", None):
+                            st.code(updater.last_parsed_json, language="json")
+                        else:
+                            st.write("（空）")
+
             except Exception as e:
                 st.warning(f"记忆提取失败：{e}")
                 new_units = []
 
             # 3.3 重要性阈值过滤（可调），写入记忆库
-            MIN_IMPORTANCE = 0.30
+            MIN_IMPORTANCE = 0.3
             added = 0
+            accepted: List[MemoryUnit] = []  # ⬅️ 新增
             for mu in new_units:
                 try:
-                    # 去重（简单基于 content）；也可以做 embedding 近邻判重
                     if any(m.content == mu.content for m in memory_store.get_all()):
                         continue
                     if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
                         st.session_state.memory_system.add_memory(mu)
+                        accepted.append(mu)   # ⬅️ 新增
                         added += 1
                 except Exception:
-                    pass
+                    st.error(f"写入数据库失败：{mu.content}")
+
+            # 3.3.1 本轮若有新增，则做事件归属（用已算好的 prompt_embedding）
+            if accepted:
+                try:
+                    assign_event_for_units(memory_store, prompt, prompt_embedding, accepted)  # ⬅️ 新增
+                except Exception as e:
+                    st.warning(f"事件归属失败：{e}")
+
 
             # 3.4 可选：给出本轮新增记忆的可视化
+            # 3.4 可视化：展示新增记忆的事件归属
             if added:
                 with st.expander(f"🧠 本轮新增 {added} 条记忆（≥ {MIN_IMPORTANCE:.2f}）", expanded=False):
                     for mu in new_units:
                         if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
-                            st.info(f"- {mu.content}  \n（importance={mu.importance:.2f}）")
+                            # 重新读取，拿到 event_id
+                            mu_fresh = memory_store.get(mu.id)
+                            if mu_fresh is None:
+                                continue
+                            st.info(f"- {mu_fresh.content}\n（importance={mu_fresh.importance:.2f}）")
+                            if getattr(mu_fresh, "event_id", None):
+                                header, _ = memory_store.get_event_context(mu_fresh.id, k_siblings=0)
+                                title = (header or {}).get("title") or "未命名事件"
+                                status = (header or {}).get("status")
+                                start_ts = (header or {}).get("start_ts")
+                                updated_at = (header or {}).get("updated_at")
+                                st.caption(
+                                    f"事件ID：`{mu_fresh.event_id}`｜事件《{title}》｜状态：{status}｜"
+                                    f"时间窗：{start_ts} → {updated_at}"
+                                )
+                            else:
+                                st.caption("（未绑定事件）")
             else:
                 st.caption("本轮未新增记忆或重要性较低。")
                 

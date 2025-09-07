@@ -64,9 +64,6 @@ def chat_with_memories(
         max_retries=max_retries,
         base_url=base_url,
     )
-    print(
-        f"yuxi debug there:\nhistory:{history}, retrieved_memories:{retrieved_memories}, current_query:{current_query}"
-    )
     return client.chat(
         current_query=current_query,
         messages=history,
