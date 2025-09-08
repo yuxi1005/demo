@@ -1,4 +1,4 @@
-import uuid
+import uuid, requests
 import datetime
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional
@@ -14,6 +14,8 @@ from utils import (
     normalize_tag_path,
     is_valid_tag_path,
     match_tag_prefix,
+    embed_text,
+    load_bgem3,
 )
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
@@ -308,10 +310,12 @@ class MemoryStore:
                 VALUES (%s, %s, %s) RETURNING id, centroid, member_count"""
         return self.query_one(sql, (title, etype, centroid))
 
-    # 3) 事件心向量与心跳（Python 里做 EMA / 平均数更简单）
+
     def touch_event_with_embedding(
         self, event_id: str, new_emb: List[float], alpha=0.7
     ):
+        """
+        用新的 embedding 更新事件的 centroid。"""
         ev = self.query_one(
             "SELECT centroid, member_count FROM event WHERE id=%s", (event_id,)
         )
@@ -333,8 +337,11 @@ class MemoryStore:
                     WHERE id=%s"""
             self.exec(sql, (vec, event_id))
 
-    # 4) 给记忆绑定事件
+    
     def bind_memory_event(self, memory_id: str, event_id: str):
+        """
+        将记忆单元绑定到事件
+        """
         self.exec(
             """UPDATE memory SET event_id=%s WHERE id=%s""", (event_id, memory_id)
         )
@@ -401,315 +408,108 @@ class MemoryStore:
         siblings = [self.get(r["id"]) for r in sib_rows]  # 复用 _row_to_mu
         return header, [s for s in siblings if s]
 
-
-@dataclass
-class EventDraft:
-    """仅驻留内存的事件草稿：聚拢相近回合，不落库。"""
-
-    title_hint: Optional[str] = None
-    centroid: Optional[List[float]] = None  # 单位球面上的心向量
-    members: List[MemoryUnit] = field(
-        default_factory=list
-    )  # 记忆单元（已写入memory表，但未绑定event_id）
-    start_ts: datetime.datetime = field(default_factory=datetime.datetime.now)
-    last_ts: datetime.datetime = field(default_factory=datetime.datetime.now)
-
-    def _norm(self, v: List[float]) -> List[float]:
-        return _l2_normalize(v or [])
-
-    def _cos(self, a: List[float], b: List[float]) -> float:
-        return _cos(a, b)
-
-    def _weighted_update(
-        self, base: Optional[List[float]], vecs: List[Tuple[List[float], float]]
-    ) -> List[float]:
-        """对单位向量做加权平均后再归一化；vecs: [(vec, weight), ...]"""
-        if not vecs:
-            return base or []
-        L = len(vecs[0][0])
-        acc = [0.0] * L  # accumulator（累加器）
-        tot = 0.0
-        for v, w in vecs:
-            if not v or w <= 0:
-                continue
-            nv = self._norm(v)
-            for i in range(min(L, len(nv))):
-                acc[i] += nv[i] * w
-            tot += w
-        if base and tot > 0:
-            # 轻度“惯性”，避免心向量抖动：旧心向量等效权重 = sum(w) * 0.2
-            base_n = self._norm(base)
-            bw = tot * 0.2
-            for i in range(min(L, len(base_n))):
-                acc[i] += base_n[i] * bw
-            tot += bw
-        if tot <= 0:
-            return base or []
-        return self._norm([x / tot for x in acc])
-
-    def add_turn_mem(
+    def search_events_by_embedding(
         self,
-        turn_text: str,
-        turn_emb: List[float],
-        units: List[MemoryUnit],
-        tau_minutes: int = 240,
-    ):
+        embedding: List[float],
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
         """
-        将本轮抽取到的记忆并入草稿，同时用“重要度×时间衰减”做加权更新心向量。
-        tau_minutes: 时间常数，默认 4 小时。
+        在 event 表里按质心向量做近似最近邻检索（pgvector / ivfflat），
+        回退：当数据库侧不可用时，Python 侧计算余弦相似度。
+        返回字段：id, centroid(list[float]), member_count, title, status, updated_at
         """
-        now = datetime.datetime.now()
-        self.last_ts = now
-        if self.title_hint is None:
-            # 第一轮先给个标题线索（最终建库时会用 utils.suggest_event_title_simple 再生成）
-            self.title_hint = (turn_text or "").strip()[:40]
+        if not embedding:
+            return []
 
-        # 构造用于更新心向量的加权样本
-        vecs: List[Tuple[List[float], float]] = []
-        for mu in units:
-            imp = max(0.0, min(1.0, float(getattr(mu, "importance", 0.0))))
-            w_imp = 0.2 + 0.8 * imp # 重要度最低给 0.2 基线，避免完全忽略；最高 1.0
-            # 时间衰减：越新权重越高
-            dt_min = max(0.0, (now - (mu.timestamp or now)).total_seconds() / 60.0) #经过的分钟数
-            w_time = math.exp(-dt_min / max(1e-6, float(tau_minutes))) # 分钟数做指数衰减
-            w = w_imp * (0.5 + 0.5 * w_time)  # 稍抬近期样本权重，时间重要性范围是 [0.5,1.0]
-            if mu.embedding:
-                vecs.append((mu.embedding, w))
-            self.members.append(mu)
+        vector_literal = "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
 
-        # turn 级别嵌入也并入一点，稳住主题
-        if turn_emb:
-            vecs.append((turn_emb, 0.6))
-
-        self.centroid = self._weighted_update(self.centroid, vecs)
-        if not self.members:
-            self.start_ts = now  # 第一次真正纳入成员时再刷新起始时间
-
-
-class EventDraftManager:
-    """
-    管理“当前事件草稿”。只在明确结束时 finalize → 真·事件表 & 绑定关系落库。
-    """
-
-    def __init__(
-        self,
-        store: MemoryStore,
-        sim_threshold: float = 0.72,
-        max_idle_minutes: int = 180,
-    ):
-        self.store = store
-        self.sim_threshold = float(sim_threshold)
-        self.max_idle_minutes = int(max_idle_minutes)
-        self.current: Optional[EventDraft] = None # 当前草稿
-
-    def _similar_to_current(self, emb: List[float]) -> float:
-        """计算与当前草稿心向量的相似度；无草稿或无心向量时返回 -1.0"""
-        if not (self.current and self.current.centroid and emb):
-            return -1.0
-        return _cos(_as_float_list(emb), _as_float_list(self.current.centroid))
-
-    def ingest(self, turn_text: str, turn_emb: List[float], units: List[MemoryUnit]):
-        """
-        将本轮”相似的记忆“聚拢进当前草稿；如未有草稿则新建。
-        不触库（不创建event，不写event_id）。
-        turn_text/turn_emb: 本轮对话文本及其嵌入
-        units: 本轮抽取到的记忆单元列表
-        """
-        now = datetime.datetime.now()
-        # 空集合直接返回（没有新增记忆就不扰动状态）
-        if not units and not turn_emb:
-            return
-
-        if self.current is None:
-            self.current = EventDraft()
-            self.current.add_turn_mem(turn_text, turn_emb, units)
-            return
-
-        # 若与当前心向量相似度过低，或草稿闲置时间过长 ——> 开启新草稿（但不自动落库旧草稿）
-        sim = self._similar_to_current(
-            turn_emb or (units[0].embedding if units and units[0].embedding else [])
-        )
-        idle_min = (now - self.current.last_ts).total_seconds() / 60.0
-        if (sim >= 0 and sim < self.sim_threshold) or (
-            idle_min > self.max_idle_minutes
-        ):
-            # 开启新的主题草稿；旧草稿仍驻内存，等待你手动 finalize()/discard()
-            self.current = EventDraft()
-
-        self.current.add_turn_mem(turn_text, turn_emb, units)
-
-    def finalize_current(self, etype: str = "misc") -> Optional[str]:
-        """
-        明确结束当前事件：创建 event 记录并绑定成员 memory.event_id。
-        返回新建 event_id；若无草稿或成员为空，返回 None。
-        """
-        if not self.current or not self.current.members:
-            self.current = None
-            return None
-
-        draft = self.current
-        self.current = None  # 先清空，避免中途异常导致重复 finalize
-
-        # 生成标题（复用你现有 utils 的简易标题器）
-        mu_texts = [m.content for m in draft.members if getattr(m, "content", None)]
-        title = suggest_event_title_simple(
-            draft.title_hint or "", mu_texts, etype=etype
-        )
-
-        centroid = _as_float_list(draft.centroid or [])
-        if not centroid and draft.members:
-            # 兜底：用成员的平均向量
-            vecs = [m.embedding for m in draft.members if m.embedding]
-            if vecs:
-                L = len(vecs[0])
-                avg = [0.0] * L
-                for v in vecs:
-                    for i in range(min(L, len(v))):
-                        avg[i] += v[i]
-                centroid = _l2_normalize([x / max(1, len(vecs)) for x in avg])
-
-        if not centroid:
-            # 实在没有向量，就不建事件，避免脏数据
-            return None
-
-        ev = self.store.create_event(title=title, centroid=centroid, etype=etype)
-        if not ev:
-            return None
-        ev_id = ev["id"]
-
-        # 绑定成员并刷新事件心向量（轻量 EMA）
-        for m in draft.members:
-            try:
-                self.store.bind_memory_event(m.id, ev_id)
-                seed = m.embedding or centroid
-                self.store.touch_event_with_embedding(
-                    ev_id, _as_float_list(seed), alpha=0.7
-                )
-            except Exception:
-                # 单条绑定失败不影响其他
-                continue
-
-        # 更新事件时间段（可选：以草稿起止时间覆写）
+        # 1) 首选：数据库侧 ANN（<=> 为 pgvector 的距离；1 - 距离 = 余弦相似度）
         try:
-            self.store.exec(
-                "UPDATE event SET start_ts=%s, end_ts=%s, status='active', updated_at=now() WHERE id=%s",
-                (draft.start_ts, draft.last_ts, ev_id),
-            )
+            with self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # 尝试提高召回率；失败也不影响主流程
+                try:
+                    cur.execute("SET ivfflat.probes = %s", (10,))
+                except Exception:
+                    pass
+
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        centroid,
+                        member_count,
+                        title,
+                        status,
+                        updated_at
+                    FROM event
+                    WHERE centroid IS NOT NULL
+                    ORDER BY centroid <=> %s::vector ASC
+                    LIMIT %s
+                    """,
+                    (vector_literal, int(limit)),
+                )
+                rows = cur.fetchall() or []
+
+            def _as_vec(v):
+                if v is None:
+                    return None
+                if isinstance(v, (list, tuple)):
+                    return list(v)
+                s = str(v).strip()
+                if s.startswith("[") and s.endswith("]"):
+                    try:
+                        return [float(x) for x in s[1:-1].split(",")]
+                    except Exception:
+                        return None
+                return None
+
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": str(r["id"]),
+                        "centroid": _as_vec(r["centroid"]),
+                        "member_count": int(r["member_count"]) if r["member_count"] is not None else 0,
+                        "title": r.get("title"),
+                        "status": r.get("status"),
+                        "updated_at": r.get("updated_at"),
+                    }
+                )
+            return out
+
         except Exception:
-            pass
+            # 2) 回退：Python 侧计算相似度并排序
+            ev_rows = self.query(
+                """
+                SELECT id, centroid, member_count, title, status, updated_at
+                FROM event
+                WHERE centroid IS NOT NULL
+                """
+            )
 
-        return ev_id
+            cand: List[Tuple[float, Dict[str, Any]]] = []
+            q = _as_float_list(embedding)
+            for ev in ev_rows:
+                cen = _as_float_list(ev.get("centroid"))
+                if not cen:
+                    continue
+                sim = _cos(q, cen)
+                ev_out = {
+                    "id": str(ev["id"]),
+                    "centroid": cen,
+                    "member_count": int(ev["member_count"]) if ev["member_count"] is not None else 0,
+                    "title": ev.get("title"),
+                    "status": ev.get("status"),
+                    "updated_at": ev.get("updated_at"),
+                }
+                cand.append((sim, ev_out))
 
-    def discard_current(self):
-        """放弃当前草稿（不建事件、不绑定）。"""
-        self.current = None
+            cand.sort(key=lambda x: x[0], reverse=True)
+            return [ev for _, ev in cand[: max(1, int(limit))]]
 
-    # —— 可选工具：把当前草稿快速切段，但不立即落库
-    def new_segment(self):
-        """结束当前段并开一个新的空草稿（旧草稿仍驻内存，等待你 finalize/ discard）。"""
-        self.current = EventDraft()
 
 
 # ---------------------- Toolboxes ----------------------
-class RetrievalManager:
-    """检索工具箱：包含所有检索记忆的方法。"""
-
-    def retrieve_by_embedding_python(
-        self, store: MemoryStore, query_embedding: List[float], top_k: int = 3
-    ) -> List[MemoryUnit]:
-        """基于嵌入向量的检索方法"""
-        matched_memories = []
-
-        for memory in store.get_all():
-            if memory.embedding is not None:
-                # 计算余弦相似度
-                similarity = self._cosine_similarity(query_embedding, memory.embedding)
-                matched_memories.append((memory, similarity))
-
-        # 按照相似度排序并返回前 top_k 个记忆
-        matched_memories.sort(key=lambda x: x[1], reverse=True)
-        return [memory for memory, _ in matched_memories[:top_k]]
-
-    # 兼容旧接口：融合检索（本地计算）
-    def retrieve_by_fusion(
-        self,
-        store: "MemoryStore",
-        query_embedding: List[float],
-        tag_prefix: Optional[str] = None,
-        top_k: int = 3,
-        alpha: float = 0.7,
-        beta: float = 0.2,
-        gamma: float = 0.1,
-        half_life_days: float = 30.0,
-    ) -> List[MemoryUnit]:
-        now = datetime.datetime.now()
-
-        def time_decay(ts: datetime.datetime) -> float:
-            dt_days = max(0.0, (now - ts).total_seconds() / 86400.0)
-            return pow(0.5, dt_days / max(1e-6, half_life_days))
-
-        candidates = []
-        for mem in store.get_all():
-            if mem.embedding is None:
-                continue
-            if tag_prefix and not any(
-                match_tag_prefix(t, tag_prefix) for t in mem.tags
-            ):
-                continue
-            sim = self._cosine_similarity(query_embedding, mem.embedding)
-            td = time_decay(mem.timestamp)
-            score = alpha * sim + beta * float(mem.importance) + gamma * td
-            candidates.append((score, mem))
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        out = [m for _, m in candidates[:top_k]]
-        for m in out:
-            store.update_retrieval_stats(m.id, 1)
-        return out
-
-    # memory.py — RetrievalManager 内新增
-    def retrieve_by_embedding_DB_python(
-        self, store: "MemoryStore", query_embedding: List[float], top_k: int = 3
-    ) -> List[MemoryUnit]:
-        """
-        Hybrid：DB 近似召回 + Python 精确重排
-        - 既保留 DB 的速度，又尽量贴近你旧版的“准”的感觉
-        """
-        import math
-
-        def cos(a, b):
-            if not a or not b:
-                return 0.0
-            dot = sum(x * y for x, y in zip(a, b))
-            na = math.sqrt(sum(x * x for x in a))
-            nb = math.sqrt(sum(y * y for y in b))
-            return dot / (na * nb) if na and nb else 0.0
-
-        # 1) 先用 DB 召回更大的候选集
-        cand_k = max(top_k * 6, 48)
-        try:
-            cands = store.search_candidates_by_embedding(
-                query_embedding, limit=cand_k, probes=12
-            )
-        except Exception:
-            cands = [m for m in store.get_all() if m.embedding]
-
-        # 2) Python 精确余弦重排（复刻你之前的排序方式）
-        scored = [(m, cos(query_embedding, m.embedding)) for m in cands if m.embedding]
-        scored.sort(key=lambda t: t[1], reverse=True)
-        out = [m for m, _ in scored[:top_k]]
-
-        # 3) 更新检索统计
-        for m in out:
-            store.update_retrieval_stats(m.id, 1)
-
-        return out
-
-    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = sum(a * a for a in vec1) ** 0.5
-        norm2 = sum(b * b for b in vec2) ** 0.5
-        return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
 
 
 class ForgettingManager:
@@ -726,47 +526,11 @@ class ForgettingManager:
                 ids.append(m.id)
         return ids
 
-
 class ReflectionManager:
     def generate_insight_v1(self, store: "MemoryStore") -> Optional[MemoryUnit]:
         return None
 
 
-# ---------------------- Update Manager (LLM extraction) ----------------------
-from utils import load_bgem3, embed_text
-import requests
-
-SYSTEM_PROMPT_EXTRACTION = """
-You are a memory extraction assistant.
-The user provides a conversation transcript.
-Return a JSON array of objects, each object only containing:
-- "content": concise atomic fact (< 100 chars)
-- "importance": float in [0,1]
-Rules:
-- Importance ∈ [0,1] based on how critical the fact is for future recall.
-- Keep content concise.
-- Output only valid JSON, no extra commentary.
-- Always return a JSON array even if you extract only one memory.
-
-"""
-
-_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")
-
-
-def _strip_code_fences(s: str) -> str:
-    return _CODE_FENCE_RE.sub("", (s or "").strip())
-
-
-def build_importance(v) -> float:
-    try:
-        x = float(v)
-    except Exception:
-        x = 0.0
-    return max(0.0, min(1.0, x))
-
-
-def build_text(v) -> str:
-    return (v if isinstance(v, str) else str(v or "")).strip()
 
 
 def assign_event_for_units(
@@ -805,79 +569,75 @@ def assign_event_for_units(
         store.touch_event_with_embedding(ev_id, _as_float_list(seed_emb), alpha=0.7)
 
 
-# shared embedder (CPU ok)
 _bgem3 = load_bgem3("BAAI/bge-m3", device="cpu")
+SYSTEM_PROMPT_EXTRACTION = """
+You are a memory extraction assistant.
+The user provides a conversation transcript.
+Return a JSON array of objects, each object only containing:
+- "content": concise atomic fact (< 100 chars)
+- "importance": float in [0,1]
+Rules:
+- Importance ∈ [0,1] based on how critical the fact is for future recall.
+- Keep content concise.
+- Output only valid JSON, no extra commentary.
+- Always return a JSON array even if you extract only one memory.
 
-
-class UpdateManager:
+"""
+def build_mu_from_raw(rawdata: str, *, api_key_path: str = "../API-KEY.txt",
+                      model: str = "deepseek-chat", timeout: int = 60) -> List["MemoryUnit"]:
     """
-    build_memories_from_raw
-    保持原有接口不变，但把关键中间结果挂到实例属性上，便于在 UI 中展示：
-      - self.last_http_json:   HTTP 层原始 JSON（str）
-      - self.last_model_text:  模型文本（去围栏后）（str）
-      - self.last_parsed_json: 被 json.loads 的数组字符串（str）
+    从用户原文 rawdata 经 LLM 抽取 JSON 数组，再构造 MemoryUnit 列表返回。
+    彻底单函数：无类、无中间状态、无额外辅助函数。
     """
+    url = "https://api.deepseek.com/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
+            {"role": "user", "content": rawdata},
+        ],
+        "temperature": 0,
+        "stream": False,
+    }
 
-    def __init__(self):
-        self.last_http_json: str = ""
-        self.last_model_text: str = ""
-        self.last_parsed_json: str = ""
+    # 读取 API Key
+    with open(api_key_path, "r", encoding="utf-8") as f:
+        api_key = f.read().strip()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
-    def build_memories_from_raw(self, rawdata: str) -> List[MemoryUnit]:
-        url = "https://api.deepseek.com/v1/chat/completions"
-        payload = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
-                {"role": "user", "content": rawdata},
-            ],
-            "temperature": 0,
-            "stream": False,
-        }
-        with open("../API-KEY.txt", "r", encoding="utf-8") as f:
-            api_key = f.read().strip()
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        self.last_http_json = ""
-        self.last_model_text = ""
-        self.last_parsed_json = ""
-
-        # simple retry
-        attempt, max_attempts = 0, 2
-        while True:
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=60)
-            except requests.exceptions.RequestException as e:
-                if attempt < max_attempts:
-                    time.sleep(2**attempt)
-                    attempt += 1
-                    continue
-                raise RuntimeError(f"【网络错误】调用 LLM 失败：{e}") from e
-            if r.status_code in (429, 500, 502, 503, 504):
-                if attempt < max_attempts:
-                    time.sleep(2**attempt)
-                    attempt += 1
-                    continue
-                raise RuntimeError(
-                    f"【API错误】{r.status_code}，重试 {max_attempts} 次后仍失败：{r.text[:500]}"
-                )
-            if r.status_code != 200:
-                raise RuntimeError(f"【API错误】{r.status_code}：{r.text[:500]}")
-            data = r.json()
-            break
-
-        # 保存 HTTP 层原始 JSON（字符串化，避免非序列化类型）
+    # 简单重试
+    attempt, max_attempts = 0, 2
+    while True:
         try:
-            self.last_http_json = json.dumps(data, ensure_ascii=False, indent=2)[:20000]
-        except Exception:
-            self.last_http_json = str(data)[:20000]
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                attempt += 1
+                continue
+            raise RuntimeError(f"调用 LLM 失败：{e}") from e
 
-        # 提取模型文本（choices[0].message.content）
-        content = ""
-        if isinstance(data, dict) and "choices" in data:
+        if r.status_code in (429, 500, 502, 503, 504):
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                attempt += 1
+                continue
+            raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
+        if r.status_code != 200:
+            raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError("LLM 返回内容非 JSON，无法解析。")
+        break
+
+    # ---- 提取模型文本，完全内联 ----
+    content = ""
+    if isinstance(data, dict):
+        if "choices" in data:
             try:
                 choice0 = data["choices"][0]
                 if isinstance(choice0, dict):
@@ -888,81 +648,52 @@ class UpdateManager:
                         content = choice0["text"]
             except Exception:
                 pass
-        if not content and isinstance(data, dict):
+        if not content:
             msg = data.get("message")
             if isinstance(msg, dict) and "content" in msg:
                 content = msg["content"]
-            if not content:
-                content = data.get("response", "")
-
-        content = _strip_code_fences(content)
-        self.last_model_text = content  # 记录去围栏后的模型原文
-
         if not content:
-            raise RuntimeError(f"【解析错误】LLM 返回为空或未知结构：{str(data)[:500]}")
+            content = data.get("response", "") or ""
 
-        # 解析为 JSON 数组
+    # 去掉可能的 ```json 围栏
+    content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", (content or "").strip())
+    if not content:
+        raise RuntimeError("LLM 返回为空或结构异常。")
+
+    # ---- 解析 JSON 数组 ----
+    items = None
+    try:
+        arr = json.loads(content)
+        if isinstance(arr, list):
+            items = arr
+    except Exception:
+        pass
+    if items is None:
+        m = re.search(r"\[\s*{[\s\S]*?}\s*\]", content)
+        if not m:
+            raise RuntimeError("无法从 LLM 文本中提取 JSON 数组。")
+        arr = json.loads(m.group(0))
+        if not isinstance(arr, list):
+            raise RuntimeError("提取片段不是 JSON 数组。")
+        items = arr
+
+    # ---- 构造 MemoryUnit ----
+    memory_units: List[MemoryUnit] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # 处理 content
+        c = str(it.get("content", "") or "").strip()
+        if not c:
+            continue
+        # importance
         try:
-            # 直接尝试
-            items = json.loads(content)
-            if not isinstance(items, list):
-                raise ValueError("非数组")
-            self.last_parsed_json = content
+            p = float(it.get("importance", 0.0))
         except Exception:
-            # 回退：宽松正则抽取首个 JSON 数组
-            m = re.search(r"\[\s*{[\s\S]*?}\s*\]", content)
-            if not m:
-                # 把原始文本和 HTTP JSON 都留给 UI 查看
-                raise RuntimeError(
-                    "【解析错误】无法从模型文本中提取 JSON 数组，请在侧边栏调试区查看 last_model_text / last_http_json。"
-                )
-            arr_text = m.group(0)
-            self.last_parsed_json = arr_text
-            items = json.loads(arr_text)
-            if not isinstance(items, list):
-                raise RuntimeError("【解析错误】提取到的片段不是 JSON 数组。")
+            p = 0.0
+        p = max(0.0, min(1.0, p))
+        # embedding
+        c_embedding = embed_text(_bgem3, f"passage:{c}").tolist()
+        memory_units.append(MemoryUnit(content=c, importance=p, embedding=c_embedding))
 
-        # 构造 MemoryUnit
-        memory_units: List[MemoryUnit] = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            c = build_text(it.get("content", ""))
-            p = build_importance(it.get("importance", 0.0))
-            c_embedding = embed_text(_bgem3, f"passage:{c}").tolist() if c else None
-            if c:
-                memory_units.append(
-                    MemoryUnit(content=c, importance=p, embedding=c_embedding)
-                )
-        return memory_units
-
-
-# ---------------------- System facade ----------------------
-class MemorySystem:
-    def __init__(
-        self,
-        store: MemoryStore,
-        retriever: RetrievalManager,
-        forgetter: "ForgettingManager",
-        reflecter: "ReflectionManager",
-    ):
-        self.store = store
-        self.retriever = retriever
-        self.forgetter = forgetter
-        self.reflecter = reflecter
-
-    def add_memory(self, memory: MemoryUnit):
-        self.store.add(memory)
-
-    def perform_forgetting(self, strategy: str, **kwargs):
-        ids_to_forget = []
-        if strategy == "importance":
-            ids_to_forget = self.forgetter.by_importance(self.store, **kwargs)
-        elif strategy == "time_decay":
-            ids_to_forget = self.forgetter.by_time_decay(self.store, **kwargs)
-        for mem_id in ids_to_forget:
-            self.store.delete(mem_id)
-
-    def print_status(self):
-        memories = self.store.get_all()
-        print(f"总记忆数: {len(memories)}")
+    return memory_units

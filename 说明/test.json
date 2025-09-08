@@ -1,0 +1,28 @@
+{
+  "id": "611aa9b9-9eb7-41c4-bf4b-e79602a9ef8f",
+  "object": "chat.completion",
+  "created": 1756988901,
+  "model": "deepseek-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "[\n  {\n    \"content\": \"User is a beginner.\",\n    \"importance\": 0.8\n  }\n]"
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 109,
+    "completion_tokens": 25,
+    "total_tokens": 134,
+    "prompt_tokens_details": {
+      "cached_tokens": 64
+    },
+    "prompt_cache_hit_tokens": 64,
+    "prompt_cache_miss_tokens": 45
+  },
+  "system_fingerprint": "fp_08f168e49b_prod0820_fp8_kvcache"
+}

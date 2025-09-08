@@ -9,15 +9,11 @@ from typing import List, Dict, Any, Optional
 from memory import (
     MemoryUnit,
     MemoryStore,
-    RetrievalManager,
-    ForgettingManager,
-    MemorySystem,
-    ReflectionManager,
-    UpdateManager,
-    assign_event_for_units
+    assign_event_for_units,
+    build_mu_from_raw,
 )
 from utils import load_bgem3, embed_text, clean_stream, _cos
-
+from Retrieval import RetrievalManager
 
 @st.cache_resource
 def get_bgem3():
@@ -39,23 +35,8 @@ def ensure_core_in_session():
         st.session_state.memory_store = MemoryStore()
     if "retriever" not in st.session_state:
         st.session_state.retriever = RetrievalManager()
-    if "forgetter" not in st.session_state:
-        st.session_state.forgetter = ForgettingManager()
-    if "reflecter" not in st.session_state:
-        st.session_state.reflecter = ReflectionManager()
-    if "updater" not in st.session_state:
-        st.session_state.updater = UpdateManager()
-    if "memory_system" not in st.session_state:
-        st.session_state.memory_system = MemorySystem(
-            st.session_state.memory_store,
-            st.session_state.retriever,
-            st.session_state.forgetter,
-            st.session_state.reflecter,
-        )
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    if "retrieval_strategy" not in st.session_state:
-        st.session_state.retrieval_strategy = "bm25"
     if "top_k" not in st.session_state:
         st.session_state.top_k = 3
     if "mem_view_mode" not in st.session_state:
@@ -73,14 +54,13 @@ def ensure_core_in_session():
     if "recent_k" not in st.session_state:
         st.session_state.recent_k = 3
 
-
 ensure_core_in_session()
 
 memory_store: MemoryStore = st.session_state.memory_store
-forgetter: ForgettingManager = st.session_state.forgetter
-reflecter: ReflectionManager = st.session_state.reflecter
-memory_system: MemorySystem = st.session_state.memory_system
-updater: UpdateManager = st.session_state.updater
+# forgetter: ForgettingManager = st.session_state.forgetter
+# reflecter: ReflectionManager = st.session_state.reflecter
+# memory_system: MemorySystem = st.session_state.memory_system
+# updater: UpdateManager = st.session_state.updater
 retrieval_manager: RetrievalManager = st.session_state.retriever
 
 # ================== Sidebar 配置（写回 retriever） ==================
@@ -91,7 +71,7 @@ with st.sidebar:
     retrieval_method = st.selectbox(
         "记忆检索方法",
         ["Hybrid (DB recall + Python rerank)", "fusion", "Python (legacy cosine)"],
-        help="Hybrid 推荐：DB 先取候选，再用 Python 精确余弦重排。"
+        help="Hybrid 推荐：DB 先取候选，再用 Python 精确余弦重排。",
     )
 
     if retrieval_method.startswith("fusion"):
@@ -102,8 +82,6 @@ with st.sidebar:
         retriever = retrieval_manager.retrieve_by_embedding_DB_python  # 新增 Hybrid
 
     # 设置检索配置
-    # st.session_state.top_k = top_k
-    # st.session_state.retriever = retriever
     st.divider()
     st.header("📚 记忆库视图")
     mem_view_mode = st.radio(
@@ -265,6 +243,7 @@ def get_latest_messages(k: int = 1) -> List[Dict[str, str]]:
 
     return latest_messages
 
+
 # ================== 主聊天逻辑 ==================
 if prompt := st.chat_input("请输入"):
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -274,8 +253,8 @@ if prompt := st.chat_input("请输入"):
         st.markdown(prompt)
 
     if st.session_state.get("to_generate") and (
-    st.session_state.get("turn_id") != st.session_state.get("handled_turn_id")
-):
+        st.session_state.get("turn_id") != st.session_state.get("handled_turn_id")
+    ):
         prompt_embedding = embed_text(bgem3, f"query:{prompt}").tolist()
 
         with st.chat_message("assistant", avatar="🤡"):
@@ -283,7 +262,9 @@ if prompt := st.chat_input("请输入"):
             with st.spinner("正在检索相关记忆..."):
                 all_memories = memory_store.get_all()
                 retrieved_memories = (
-                    retriever(memory_store, prompt_embedding, top_k=st.session_state.top_k)
+                    retriever(
+                        memory_store, prompt_embedding, top_k=st.session_state.top_k
+                    )
                     or []
                 )
 
@@ -296,17 +277,24 @@ if prompt := st.chat_input("请输入"):
                 with st.expander("🔍 本轮检索到的记忆"):
                     if expanded_mems:
                         for mem in expanded_mems:
-                            st.info(f"**内容:** {mem.content}\n\n**检索次数:** {mem.retrieval_count}")
+                            st.info(
+                                f"**内容:** {mem.content}\n\n**检索次数:** {mem.retrieval_count}"
+                            )
                             # ⬇️ 新增：显示所属事件与兄弟记忆
-                            header, siblings = memory_store.get_event_context(mem.id, k_siblings=3)
+                            header, siblings = memory_store.get_event_context(
+                                mem.id, k_siblings=3
+                            )
                             if header:
-                                st.caption(f"事件：《{header.get('title') or '未命名事件'}》"
-                                        f"｜状态：{header.get('status')}｜时间窗：{header.get('start_ts')} → {header.get('updated_at')}")
+                                st.caption(
+                                    f"事件：《{header.get('title') or '未命名事件'}》"
+                                    f"｜状态：{header.get('status')}｜时间窗：{header.get('start_ts')} → {header.get('updated_at')}"
+                                )
                                 for s in siblings:
-                                    st.write(f"· 兄弟：{s.content}（imp={getattr(s,'importance',0):.2f}）")
+                                    st.write(
+                                        f"· 兄弟：{s.content}（imp={getattr(s,'importance',0):.2f}）"
+                                    )
                     else:
                         st.warning("未检索到相关记忆。")
-
 
             # 2) 生成回复
             st.caption(
@@ -322,7 +310,11 @@ if prompt := st.chat_input("请输入"):
                     if m.get("role") in ("user", "assistant")
                 ]
 
-                history_wo_current = history[:-1] if history and history[-1].get("role") == "user" else history
+                history_wo_current = (
+                    history[:-1]
+                    if history and history[-1].get("role") == "user"
+                    else history
+                )
                 recent_dialog = history_wo_current[-2 * k :] if k else []
 
                 assistant_response_stream = chat_with_memories(
@@ -331,7 +323,7 @@ if prompt := st.chat_input("请输入"):
                     recent_dialog=recent_dialog,
                     retrieved_memories=expanded_mems,
                     current_query=prompt,
-                    stream=stream_mode,  
+                    stream=stream_mode,
                 )
 
                 cleaned_stream = clean_stream(assistant_response_stream)
@@ -346,29 +338,12 @@ if prompt := st.chat_input("请输入"):
             raw_for_memory = f"User: {prompt}"
 
             # 3.2 调用提取器（DeepSeek），返回 MemoryUnit 列表（已自带 importance 与 embedding）
-            updater: UpdateManager = st.session_state.updater
             try:
                 with st.spinner("正在从本轮对话中提取记忆…"):
-                    new_units = updater.build_memories_from_raw(raw_for_memory)  # -> List[MemoryUnit]
-                    # —— 调试：展示 LLM 原始返回 / 模型文本 / 被解析 JSON —— debug
-                    with st.expander("🧪 记忆提取调试（LLM 原始返回）", expanded=False):
-                        # st.caption("last_http_json（HTTP 原始 JSON，前 20KB）：")
-                        # if getattr(updater, "last_http_json", None):
-                        #     st.code(updater.last_http_json, language="json")
-                        # else:
-                        #     st.write("（空）")
-
-                        # st.caption("last_model_text（模型文本，去掉 ``` 围栏后）：")
-                        # if getattr(updater, "last_model_text", None):
-                        #     st.code(updater.last_model_text, language="json")
-                        # else:
-                        #     st.write("（空）")
-
-                        st.caption("last_parsed_json（用于 json.loads 的数组字符串）：")
-                        if getattr(updater, "last_parsed_json", None):
-                            st.code(updater.last_parsed_json, language="json")
-                        else:
-                            st.write("（空）")
+                    new_units = build_mu_from_raw(
+                        raw_for_memory
+                    )  # -> List[MemoryUnit]
+                    
 
             except Exception as e:
                 st.warning(f"记忆提取失败：{e}")
@@ -384,7 +359,7 @@ if prompt := st.chat_input("请输入"):
                         continue
                     if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
                         st.session_state.memory_system.add_memory(mu)
-                        accepted.append(mu)   # ⬅️ 新增
+                        accepted.append(mu)  # ⬅️ 新增
                         added += 1
                 except Exception:
                     st.error(f"写入数据库失败：{mu.content}")
@@ -392,24 +367,32 @@ if prompt := st.chat_input("请输入"):
             # 3.3.1 本轮若有新增，则做事件归属（用已算好的 prompt_embedding）
             if accepted:
                 try:
-                    assign_event_for_units(memory_store, prompt, prompt_embedding, accepted)  # ⬅️ 新增
+                    assign_event_for_units(
+                        memory_store, prompt, prompt_embedding, accepted
+                    )  # ⬅️ 新增
                 except Exception as e:
                     st.warning(f"事件归属失败：{e}")
-
 
             # 3.4 可选：给出本轮新增记忆的可视化
             # 3.4 可视化：展示新增记忆的事件归属
             if added:
-                with st.expander(f"🧠 本轮新增 {added} 条记忆（≥ {MIN_IMPORTANCE:.2f}）", expanded=False):
+                with st.expander(
+                    f"🧠 本轮新增 {added} 条记忆（≥ {MIN_IMPORTANCE:.2f}）",
+                    expanded=False,
+                ):
                     for mu in new_units:
                         if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
                             # 重新读取，拿到 event_id
                             mu_fresh = memory_store.get(mu.id)
                             if mu_fresh is None:
                                 continue
-                            st.info(f"- {mu_fresh.content}\n（importance={mu_fresh.importance:.2f}）")
+                            st.info(
+                                f"- {mu_fresh.content}\n（importance={mu_fresh.importance:.2f}）"
+                            )
                             if getattr(mu_fresh, "event_id", None):
-                                header, _ = memory_store.get_event_context(mu_fresh.id, k_siblings=0)
+                                header, _ = memory_store.get_event_context(
+                                    mu_fresh.id, k_siblings=0
+                                )
                                 title = (header or {}).get("title") or "未命名事件"
                                 status = (header or {}).get("status")
                                 start_ts = (header or {}).get("start_ts")
@@ -422,7 +405,7 @@ if prompt := st.chat_input("请输入"):
                                 st.caption("（未绑定事件）")
             else:
                 st.caption("本轮未新增记忆或重要性较低。")
-                
+
     st.session_state.handled_turn_id = st.session_state.turn_id
     st.session_state.to_generate = False
 
