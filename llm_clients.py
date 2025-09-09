@@ -1,4 +1,8 @@
 import os, json, time, requests, re
+from datetime import datetime
+current_ts = datetime.now().isoformat()
+print(current_ts)
+
 from typing import List, Dict, Optional, Any, Sequence, Tuple, Union
 from memory import MemoryUnit
 
@@ -37,7 +41,7 @@ def _safe_text(resp) -> str:
 def chat_with_memories(
     provider: str,
     model: Optional[str],
-    recent_dialog: DialogLike,
+    history: List[Dict[str, str]],
     retrieved_memories: Optional[Sequence[Union[str, MemoryUnit]]],
     current_query: str,
     *,
@@ -50,12 +54,11 @@ def chat_with_memories(
     一键对话入口：
     - provider: "deepseek" | "ollama"
     - model: deepseek 如 "deepseek-chat"；ollama 为本地模型名，如 "qwen2.5:14b"
-    - recent_dialog: 近期 k 轮对话
+    - history: 近期 k 轮对话
     - retrieved_memories: 检索到的记忆（字符串或 MemoryUnit；自动读取 .content）
     - current_query: 当前用户 query（必要时会补到最后一条 user）
     - stream: True 则返回一个生成器；False 返回完整字符串
     """
-    history = _normalize_dialog(recent_dialog)
 
     client = LLMClient(
         provider=provider,
@@ -151,18 +154,22 @@ class LLMClient:
                 continue
             lines.append(f"{role.capitalize()}: {content}")
         history_block = "\n".join(lines) or "（无）"
-
+        
+        current_ts = datetime.now().isoformat()
         # --- 真正格式化 system 提示 ---
         system_prompt = (
-            f"You are a helpful assistant with long-term memory.\n"
-            f"Conversation (last k turns):\n{history_block}\n\n"
-            f"Relevant Memories:\n{memory_block}\n\n"
-            "Policy:\n"
-            "- Treat Conversation as primary; use memories only when helpful.\n"
-            "- No chain-of-thought; do NOT output <think>.\n"
-            "- Match user's language; be concise.\n"
-            "Now answer the latest user query."
-        )
+            "You are a helpful assistant with long-term memory.\n\n"
+            f"Current Time: {current_ts}\n\n"
+            "Conversation (last k turns):\n"
+            f"{history_block}\n\n"
+            "Relevant Memories:\n"
+            f"{memory_block}\n\n"
+            "Guidelines:\n"
+            "- Prioritize the current conversation; consult memories only if they add useful context.\n"
+            "- Do not reveal reasoning steps or use <think>.\n"
+            "- Respond in the user's language and keep answers concise.\n\n"
+            "Please answer the user's latest query."
+                )
 
         # --- 输出的消息序列：system +（可选）历史 + 本轮 user ---
         out = [{"role": "system", "content": system_prompt}]
@@ -292,10 +299,11 @@ class LLMClient:
 
     # ---------- 私有：Ollama（流式） ----------
     def _chat_ollama_stream(self, messages):
+        print(f"yuxi debug:{len(messages[-1]['content'])}")
         url = f"{self.base_url}/api/chat"
         headers = {"Content-Type": "application/json"}
 
-        options = {"num_predict": 256, "num_ctx": 2048}
+        options = {"num_predict": -1, "num_ctx": 2048} # -1无限生成, 2048上下文
         payload = {
             "model": self.model,
             "messages": messages,

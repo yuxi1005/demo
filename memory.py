@@ -57,8 +57,6 @@ class MemoryUnit:
             tags=cleaned,
             embedding=embedding,
         )
-
-
 # ---------------------- Storage (PostgreSQL) ----------------------
 class MemoryStore:
     """
@@ -507,11 +505,7 @@ class MemoryStore:
             cand.sort(key=lambda x: x[0], reverse=True)
             return [ev for _, ev in cand[: max(1, int(limit))]]
 
-
-
 # ---------------------- Toolboxes ----------------------
-
-
 class ForgettingManager:
     def by_importance(self, store: "MemoryStore", threshold: float = 0.2) -> List[str]:
         ids = [m.id for m in store.get_all() if m.importance < threshold]
@@ -529,9 +523,6 @@ class ForgettingManager:
 class ReflectionManager:
     def generate_insight_v1(self, store: "MemoryStore") -> Optional[MemoryUnit]:
         return None
-
-
-
 
 def assign_event_for_units(
     store: MemoryStore, turn_text: str, turn_emb: List[float], units: List[MemoryUnit]
@@ -569,131 +560,133 @@ def assign_event_for_units(
         store.touch_event_with_embedding(ev_id, _as_float_list(seed_emb), alpha=0.7)
 
 
-_bgem3 = load_bgem3("BAAI/bge-m3", device="cpu")
-SYSTEM_PROMPT_EXTRACTION = """
-You are a memory extraction assistant.
-The user provides a conversation transcript.
-Return a JSON array of objects, each object only containing:
-- "content": concise atomic fact (< 100 chars)
-- "importance": float in [0,1]
-Rules:
-- Importance ∈ [0,1] based on how critical the fact is for future recall.
-- Keep content concise.
-- Output only valid JSON, no extra commentary.
-- Always return a JSON array even if you extract only one memory.
+# _bgem3 = load_bgem3("BAAI/bge-m3", device="cpu")
+# SYSTEM_PROMPT_EXTRACTION = """
+# You are a memory extraction assistant.
+# The user provides a conversation transcript.
+# Return a JSON array of objects, each object only containing:
+# - "content": concise atomic fact (< 100 chars)
+# - "importance": float in [0,1]
+# Rules:
+# - Importance ∈ [0,1] based on how critical the fact is for future recall.
+# - Keep content concise.
+# - Output only valid JSON, no extra commentary.
+# - Always return a JSON array even if you extract only one memory.
 
-"""
-def build_mu_from_raw(rawdata: str, *, api_key_path: str = "../API-KEY.txt",
-                      model: str = "deepseek-chat", timeout: int = 60) -> List["MemoryUnit"]:
-    """
-    从用户原文 rawdata 经 LLM 抽取 JSON 数组，再构造 MemoryUnit 列表返回。
-    彻底单函数：无类、无中间状态、无额外辅助函数。
-    """
-    url = "https://api.deepseek.com/v1/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
-            {"role": "user", "content": rawdata},
-        ],
-        "temperature": 0,
-        "stream": False,
-    }
+# """
 
-    # 读取 API Key
-    with open(api_key_path, "r", encoding="utf-8") as f:
-        api_key = f.read().strip()
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+# def build_mu_from_raw(rawdata: str, *, api_key_path: str = "../API-KEY.txt",
+    #                   model: str = "deepseek-chat", timeout: int = 60) -> List["MemoryUnit"]:
+    # """
+    # 从用户原文 rawdata 经 LLM 抽取 JSON 数组，再构造 MemoryUnit 列表返回。
+    # 彻底单函数：无类、无中间状态、无额外辅助函数。
+    # """
+    # url = "https://api.deepseek.com/v1/chat/completions"
+    # payload = {
+    #     "model": model,
+    #     "messages": [
+    #         {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
+    #         {"role": "user", "content": rawdata},
+            
+    #     ],
+    #     "temperature": 0,
+    #     "stream": False,
+    # }
 
-    # 简单重试
-    attempt, max_attempts = 0, 2
-    while True:
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        except requests.exceptions.RequestException as e:
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-                attempt += 1
-                continue
-            raise RuntimeError(f"调用 LLM 失败：{e}") from e
+    # # 读取 API Key
+    # with open(api_key_path, "r", encoding="utf-8") as f:
+    #     api_key = f.read().strip()
+    # headers = {
+    #     "Authorization": f"Bearer {api_key}",
+    #     "Content-Type": "application/json",
+    # }
 
-        if r.status_code in (429, 500, 502, 503, 504):
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-                attempt += 1
-                continue
-            raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
-        if r.status_code != 200:
-            raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
-        try:
-            data = r.json()
-        except Exception:
-            raise RuntimeError("LLM 返回内容非 JSON，无法解析。")
-        break
+    # # 简单重试
+    # attempt, max_attempts = 0, 2
+    # while True:
+    #     try:
+    #         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    #     except requests.exceptions.RequestException as e:
+    #         if attempt < max_attempts:
+    #             time.sleep(2 ** attempt)
+    #             attempt += 1
+    #             continue
+    #         raise RuntimeError(f"调用 LLM 失败：{e}") from e
 
-    # ---- 提取模型文本，完全内联 ----
-    content = ""
-    if isinstance(data, dict):
-        if "choices" in data:
-            try:
-                choice0 = data["choices"][0]
-                if isinstance(choice0, dict):
-                    msg = choice0.get("message")
-                    if isinstance(msg, dict) and "content" in msg:
-                        content = msg["content"]
-                    if not content and "text" in choice0:
-                        content = choice0["text"]
-            except Exception:
-                pass
-        if not content:
-            msg = data.get("message")
-            if isinstance(msg, dict) and "content" in msg:
-                content = msg["content"]
-        if not content:
-            content = data.get("response", "") or ""
+    #     if r.status_code in (429, 500, 502, 503, 504):
+    #         if attempt < max_attempts:
+    #             time.sleep(2 ** attempt)
+    #             attempt += 1
+    #             continue
+    #         raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
+    #     if r.status_code != 200:
+    #         raise RuntimeError(f"LLM API 错误 {r.status_code}：{r.text[:500]}")
+    #     try:
+    #         data = r.json()
+    #     except Exception:
+    #         raise RuntimeError("LLM 返回内容非 JSON，无法解析。")
+    #     break
 
-    # 去掉可能的 ```json 围栏
-    content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", (content or "").strip())
-    if not content:
-        raise RuntimeError("LLM 返回为空或结构异常。")
+    # # ---- 提取模型文本，完全内联 ----
+    # content = ""
+    # if isinstance(data, dict):
+    #     if "choices" in data:
+    #         try:
+    #             choice0 = data["choices"][0]
+    #             if isinstance(choice0, dict):
+    #                 msg = choice0.get("message")
+    #                 if isinstance(msg, dict) and "content" in msg:
+    #                     content = msg["content"]
+    #                 if not content and "text" in choice0:
+    #                     content = choice0["text"]
+    #         except Exception:
+    #             pass
+    #     if not content:
+    #         msg = data.get("message")
+    #         if isinstance(msg, dict) and "content" in msg:
+    #             content = msg["content"]
+    #     if not content:
+    #         content = data.get("response", "") or ""
 
-    # ---- 解析 JSON 数组 ----
-    items = None
-    try:
-        arr = json.loads(content)
-        if isinstance(arr, list):
-            items = arr
-    except Exception:
-        pass
-    if items is None:
-        m = re.search(r"\[\s*{[\s\S]*?}\s*\]", content)
-        if not m:
-            raise RuntimeError("无法从 LLM 文本中提取 JSON 数组。")
-        arr = json.loads(m.group(0))
-        if not isinstance(arr, list):
-            raise RuntimeError("提取片段不是 JSON 数组。")
-        items = arr
+    # # 去掉可能的 ```json 围栏
+    # content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", (content or "").strip())
+    # if not content:
+    #     raise RuntimeError("LLM 返回为空或结构异常。")
 
-    # ---- 构造 MemoryUnit ----
-    memory_units: List[MemoryUnit] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        # 处理 content
-        c = str(it.get("content", "") or "").strip()
-        if not c:
-            continue
-        # importance
-        try:
-            p = float(it.get("importance", 0.0))
-        except Exception:
-            p = 0.0
-        p = max(0.0, min(1.0, p))
-        # embedding
-        c_embedding = embed_text(_bgem3, f"passage:{c}").tolist()
-        memory_units.append(MemoryUnit(content=c, importance=p, embedding=c_embedding))
+    # # ---- 解析 JSON 数组 ----
+    # items = None
+    # try:
+    #     arr = json.loads(content)
+    #     if isinstance(arr, list):
+    #         items = arr
+    # except Exception:
+    #     pass
+    # if items is None:
+    #     m = re.search(r"\[\s*{[\s\S]*?}\s*\]", content)
+    #     if not m:
+    #         raise RuntimeError("无法从 LLM 文本中提取 JSON 数组。")
+    #     arr = json.loads(m.group(0))
+    #     if not isinstance(arr, list):
+    #         raise RuntimeError("提取片段不是 JSON 数组。")
+    #     items = arr
 
-    return memory_units
+    # # ---- 构造 MemoryUnit ----
+    # memory_units: List[MemoryUnit] = []
+    # for it in items:
+    #     if not isinstance(it, dict):
+    #         continue
+    #     # 处理 content
+    #     c = str(it.get("content", "") or "").strip()
+    #     if not c:
+    #         continue
+    #     # importance
+    #     try:
+    #         p = float(it.get("importance", 0.0))
+    #     except Exception:
+    #         p = 0.0
+    #     p = max(0.0, min(1.0, p))
+    #     # embedding
+    #     c_embedding = embed_text(_bgem3, f"passage:{c}").tolist()
+    #     memory_units.append(MemoryUnit(content=c, importance=p, embedding=c_embedding))
+
+    # return memory_units

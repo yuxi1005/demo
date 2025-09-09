@@ -1,20 +1,34 @@
-import streamlit as st
+# ------------- 标准库 -------------
 import uuid
-import datetime
+import re
 import json
 import time
+import traceback
+import datetime as dt
+from datetime import datetime
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import (
+    List, Dict, Any, Optional, Tuple,
+    Iterable, Literal, overload, cast
+)
+
+# ------------- 第三方库 -------------
+import streamlit as st
+
+# ------------- 项目内部 -------------
 from llm_clients import chat_with_memories
-from typing import List, Dict, Any, Optional
 from memory import (
     MemoryUnit,
     MemoryStore,
     assign_event_for_units,
-    build_mu_from_raw,
+    # build_mu_from_raw,
 )
-from utils import load_bgem3, embed_text, clean_stream, _cos
+from utils import (
+    load_bgem3, embed_text, clean_stream, _cos,
+    call_llm_segment_and_extract, run_llm, _ensure_float_ts
+)
 from Retrieval import RetrievalManager
-
 @st.cache_resource
 def get_bgem3():
     return load_bgem3("BAAI/bge-m3")
@@ -25,7 +39,6 @@ bgem3 = get_bgem3()
 # ================== Streamlit UI 配置 ==================
 st.set_page_config(page_title="🍝yuxi's LLM长时记忆实验", layout="wide")
 st.title("🍝yuxi's LLM长时记忆实验")
-# st.caption("先做个小垃圾")
 stream_mode = True
 
 
@@ -107,33 +120,31 @@ with st.sidebar:
     st.header("🧹 工具")
 
     def _ts_iso(ts):
-        return ts.isoformat() if isinstance(ts, datetime.datetime) else None
+        return ts.isoformat() if isinstance(ts, dt.datetime) else None
 
     # 导出记忆
     def export_memories() -> bytes:
-        data = []
-        for m in memory_store.get_all():
-            data.append(
-                {
-                    "id": getattr(m, "id", None),
-                    "content": m.content,
-                    "timestamp": _ts_iso(getattr(m, "timestamp", None)),
-                    "importance": getattr(m, "importance", 0.0),
-                    "retrieval_count": getattr(m, "retrieval_count", 0),
-                    "last_accessed_ts": _ts_iso(getattr(m, "last_accessed_ts", None)),
-                }
-            )
-        return json.dumps({"memories": data}, ensure_ascii=False, indent=2).encode(
-            "utf-8"
-        )
+        store = st.session_state.memory_store
+        rows = []
+        for m in store.get_all():  # 你的遍历方式按实际API调整
+            rows.append({
+                "id": getattr(m, "id", None),
+                "content": getattr(m, "content", None),
+                "timestamp": _ts_iso(getattr(m, "timestamp", None)),
+                "importance": getattr(m, "importance", 0.0),
+                "retrieval_count": getattr(m, "retrieval_count", 0),
+                "last_accessed_ts": _ts_iso(getattr(m, "last_accessed_ts", None)),
+                "embedding_dim": len(getattr(m, "embedding", []) or []),
+            })
+        return json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8")
 
     st.download_button(
-        "📤 导出记忆（JSON）",
-        data=export_memories(),
-        file_name=f"memories_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+    "📤 导出记忆（JSON）",
+    data=export_memories(),
+    file_name=f"memories_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+    mime="application/json",
+    use_container_width=True,
+)
 
     # 导入记忆
     uploaded = st.file_uploader("📥 导入记忆（JSON）", type=["json"])
@@ -151,7 +162,7 @@ with st.sidebar:
                     m.id = item["id"]
                 if hasattr(m, "timestamp") and item.get("timestamp"):
                     try:
-                        m.timestamp = datetime.datetime.fromisoformat(item["timestamp"])
+                        m.timestamp = dt.datetime.fromisoformat(item["timestamp"])
                     except Exception:
                         pass
                 if (
@@ -161,7 +172,7 @@ with st.sidebar:
                     m.retrieval_count = int(item["retrieval_count"])
                 if hasattr(m, "last_accessed_ts") and item.get("last_accessed_ts"):
                     try:
-                        m.last_accessed_ts = datetime.datetime.fromisoformat(
+                        m.last_accessed_ts = dt.datetime.fromisoformat(
                             item["last_accessed_ts"]
                         )
                     except Exception:
@@ -195,58 +206,354 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 
-def get_latest_messages(k: int = 1) -> List[Dict[str, str]]:
+# ================== 触发批量处理的条件函数 ==================
+def should_trigger_by_rounds(
+    round_cap: int = 10,
+    *,
+    roles_for_rounds: Iterable[str] = ("user",),  # 计“轮”的角色，默认只算用户
+) -> Tuple[bool, int]:
+    """
+    仅按“轮数”判断是否触发。
+    返回: (should_by_rounds, rounds_since_last)
+      - should_by_rounds: 自上次批处理以来，满足 roles_for_rounds 的消息数 >= round_cap
+      - rounds_since_last: 自 last_batch_msg_idx 之后的“轮数”（按角色过滤计数）
+    说明：
+      - 一“轮” = 一条满足 roles_for_rounds 的消息；通常就是 user 发言次数。
+      - 不处理 idle、时间等其他条件。
+    """
+    msgs = getattr(st.session_state, "messages", [])
+    if not msgs:
+        return False, 0
+
+    last_idx_prev = int(st.session_state.get("last_batch_msg_idx", -1))
+    start_idx = max(-1, last_idx_prev) + 1
+    role_set = set(roles_for_rounds)
+
+    rounds_since_last = 0
+    if start_idx < len(msgs):
+        for m in msgs[start_idx:]:
+            if (m or {}).get("role") in role_set:
+                rounds_since_last += 1
+
+    return (rounds_since_last >= round_cap), rounds_since_last
+
+def _keep_last_two_sentences(text: str) -> str:
+    """
+    保留文本的最后两句话。
+    用中英文常见句号/问号/叹号作为分隔。
+    """
+    # 用正则切分句子，保留分隔符
+    parts = re.split(r'([。！？!?\.])', text)
+    # 把句子和标点拼回去
+    sentences = ["".join(parts[i:i+2]).strip() for i in range(0, len(parts), 2) if parts[i].strip()]
+    if len(sentences) <= 2:
+        return text.strip()
+    return "".join(sentences[-2:]).strip()
+
+def _parse_ts(ts: Any) -> Optional[float]:
+    """统一转 epoch 秒；失败返回 None。支持 datetime/秒/毫秒/字符串数字。"""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.timestamp()
+    try:
+        x = float(ts)
+    except Exception:
+        return None
+    return x / 1000.0 if x > 1e12 else x  # 13位毫秒 → 秒
+
+def _sanitize_msg(x: Any) -> Dict[str, Any]:
+    """
+    把任意对象标准化为 {role, content, ts} 的 dict。
+    - role/内容缺失时给空字符串；
+    - ts 尝试解析为秒，否则 None（不丢字段，便于后续使用）。
+    """
+    if isinstance(x, dict):
+        role = str(x.get("role", "") or "")
+        content = str(x.get("content", "") or "")
+        ts = _parse_ts(x.get("ts"))
+        return {"role": role, "content": content, "ts": ts}
+    # 兜底：把奇怪类型收敛成一条“未知角色”的消息
+    return {"role": "", "content": str(x), "ts": None}
+
+def get_latest_messages(
+    k: int = 1,
+    *,
+    roles_for_idle: Iterable[str] = ("user",),   # 计算空闲时长时关注的角色
+    return_last_ts: bool = False,                # True: 返回 (messages, last_ts)
+) -> List[Dict[str, str]] | Tuple[List[Dict[str, str]], Optional[float]]:
     """
     从 Streamlit 会话状态中获取最近的对话消息。
-
-    Args:
-        k (int):
-            - 如果 k=1，只返回最后一条用户消息。
-            - 如果 k>1，返回最近 k 轮完整的用户-助手对话。
-
-    Returns:
-        List[Dict[str, str]]: 一个包含消息字典的列表。
+    - 如果 k=1，只返回最后一条用户消息。
+    - 如果 k>1，返回最近 k 轮完整的用户-助手对话。
+    对助手消息只保    留最后两句话（通过 _keep_last_two_sentences）。
+    额外：当 return_last_ts=True 时，返回 (消息列表, roles_for_idle 的最后一条消息时间戳[秒])。
     """
-    if not hasattr(st.session_state, "messages") or not st.session_state.messages:
-        return []
 
-    messages = st.session_state.messages
-    latest_messages = []
+    raw = getattr(st.session_state, "messages", None)
+    if not raw:
+        return ([], None) if return_last_ts else []
 
-    # 始终从最新的消息开始向前遍历
-    # 使用 set 记录已找到的对话轮次，以处理 k > 1 的情况
+    # 先把全量消息“标准化”，避免后面因类型混入而炸
+    messages: List[Dict[str, Any]] = [_sanitize_msg(m) for m in raw]
+
+    latest_messages: List[Dict[str, Any]] = []
     conversation_count = 0
 
+    # === 1) 反向采集，得到最近 k 轮（按 user 计轮次）===
     for i in range(len(messages) - 1, -1, -1):
-        message = messages[i]
+        m = dict(messages[i])  # 复制，避免改源
+        if m.get("role") == "assistant":
+            m["content"] = _keep_last_two_sentences(m.get("content", "") or "")
 
-        # 找到一条用户消息，即找到一轮对话
-        if message["role"] == "user":
+        if m.get("role") == "user":
             conversation_count += 1
 
-        # 始终添加当前消息
-        latest_messages.append(message)
-
-        # 如果达到了指定的对话轮次 k，停止遍历
+        latest_messages.append(m)
         if conversation_count >= k:
             break
 
-    # 因为是从后向前遍历，所以需要反转列表以保持时间顺序
     latest_messages.reverse()
 
-    # 特殊处理 k=1 的情况，只返回最后一条用户消息
-    if k == 1 and latest_messages:
-        # 找到最后一条消息中 role 为 "user" 的那条
+    # === 2) k==1 且仅需最后一条用户消息时的优化返回 ===
+    if k == 1 and latest_messages and not return_last_ts:
         for msg in reversed(latest_messages):
-            if msg["role"] == "user":
+            if msg.get("role") == "user":
                 return [msg]
 
-    return latest_messages
+    # === 3) 需要返回最后一条“关注角色”的时间戳 ===
+    last_ts: Optional[float] = None
+    if return_last_ts:
+        role_set = set(roles_for_idle)
+        for m in reversed(messages):  # 用全量 messages 计算 last_ts（不受 k 截断）
+            if m.get("role") in role_set:
+                t = m.get("ts")
+                if t is None:
+                    t = _parse_ts(m.get("ts"))  # 再兜一层，虽按理已在 _sanitize_msg 做过
+                if t is not None:
+                    last_ts = t
+                    break
+
+    return (latest_messages, last_ts) if return_last_ts else latest_messages
+
+def compute_adaptive_k(
+    max_k: int = 20,
+    min_k: int = 1,
+    idle_threshold_sec: int = 5 * 60,  # 满足：最近一次停滞 ≥ 此阈值
+    turn_threshold: int = 4,           # 满足：最近用户轮数 ≥ 此阈值
+) -> int:
+    """
+    自适应返回 k：
+    - 若“停滞时间”或“最近轮数”任一触发，则返回对应的 k（并裁剪到 [min_k, max_k]）
+    - 否则返回 1（仅处理本轮）
+    不做任何 embedding/相似度计算，轻量稳健。
+    """
+    msgs = getattr(st.session_state, "messages", [])
+    if not msgs:
+        return 1
+
+    n = len(msgs)
+    if n == 0:
+        return 1
+
+    # ---------- 条件 A：长时间停滞 ----------
+    # 找到“最近一次大停顿”后第一条消息，把该点之后的用户轮数作为 k 候选
+    idle_k: Optional[int] = None
+    # 仅当消息都有 ts 时才启用停滞判断；否则忽略此条件
+    if all(m.get("ts") is not None for m in msgs[-min(n, 2*max_k):]):
+        now_ts = time.time()
+        last_ts = msgs[-1].get("ts") or now_ts
+        prev_ts = last_ts
+        user_turns_after_idle = 0
+        for i in range(n - 1, -1, -1):
+            ts_i = msgs[i].get("ts")
+            gap = prev_ts - ts_i
+            prev_ts = ts_i
+            if msgs[i].get("role") == "user":
+                user_turns_after_idle += 1
+            if gap >= idle_threshold_sec:
+                idle_k = max(1, user_turns_after_idle)
+                break
+        # 若一直没有达到停滞阈值，idle_k 维持 None
+
+    # ---------- 条件 B：最近轮数较多 ----------
+    # 从结尾向前数最近的用户消息条数，作为 k 候选
+    recent_user_turns = 0
+    for i in range(n - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            recent_user_turns += 1
+        # 不必扫太多，够用就停
+        if recent_user_turns >= max_k:
+            break
+    turns_k: Optional[int] = recent_user_turns if recent_user_turns >= turn_threshold else None
+
+    # ---------- 合并策略 ----------
+    # 优先使用“停滞触发”的 k，否则看“轮数触发”，否则返回 1
+    if isinstance(idle_k, int):
+        k = max(min_k, min(idle_k, max_k))
+        return k
+
+    if isinstance(turns_k, int):
+        k = max(min_k, min(turns_k, max_k))
+        return k
+
+    return 1
+
+# 水位管理
+def _get_watermark() -> int:
+    return int(st.session_state.get("processed_until_msg_idx", -1))
+
+def _set_watermark(idx: int):
+    st.session_state["processed_until_msg_idx"] = int(idx)
+
+def persist_segments_except_last_with_wm(
+    store: "MemoryStore",
+    result: dict,
+    *,
+    verbose: bool = True,
+    log=None,
+    allow_persist_when_single_segment: bool = False,
+) -> list:
+    """
+    处理 LLM 切分+抽取结果，持久化“非最后段”的记忆单元。记录水位。
+    """
+    import traceback
+
+    def _L(*args):
+        if verbose:
+            (log or print)(*args)
+
+    segments = result.get("segments") or []
+    if not isinstance(segments, list):
+        _L("⚠️ result['segments'] 不是 list：", type(segments))
+        segments = []
+
+    _L("—— persist_segments_except_last_with_wm ——")
+    _L("segments.len =", len(segments))
+
+    if not segments:
+        _L("❎ 空 segments，直接返回。")
+        return []
+
+    wm = _get_watermark()
+    _L("当前水位(wm) =", wm)
+
+    # 打印每个 segment 的概览
+    for idx, seg in enumerate(segments):
+        b = seg.get("begin_turn", None)
+        e_raw = seg.get("end_turn", None)
+        try:
+            e = int(e_raw) if e_raw is not None else None
+        except Exception:
+            e = None
+        mems = seg.get("memories", []) or []
+        _L(f"  seg[{idx}]: begin={b}, end={e}, memories={len(mems)}", "(最后段)" if idx == len(segments)-1 else "")
+
+    # 选可用段：默认丢最后段；如果只有1段且允许兜底，则不丢
+    if len(segments) == 1 and allow_persist_when_single_segment:
+        candidate = segments  # 兜底：单段也入库
+        _L("⚠️ 只有 1 段，且允许单段兜底：不过滤最后段。")
+    else:
+        candidate = segments[:-1]
+        if len(segments) == 1:
+            _L("❗ 只有 1 段，且禁止单段兜底：按规则丢弃最后段 => 0 入库。")
+
+    # end_turn 过滤 + 记录过滤原因
+    usable = []
+    for idx, seg in enumerate(candidate):
+        e_raw = seg.get("end_turn", None)
+        try:
+            e = int(e_raw)
+        except Exception:
+            e = None
+        if e is None:
+            _L(f"  ✂️ 过滤 seg(end_turn 无法解析)：end_turn={e_raw}")
+            continue
+        if e <= wm:
+            _L(f"  ✂️ 过滤 seg(end_turn≤wm)：end_turn={e} ≤ wm={wm}")
+            continue
+        usable.append(seg)
+
+    _L("通过过滤的段数 usable.len =", len(usable))
+
+    out_units = []
+    max_end = wm
+
+    for seg in usable:
+        try:
+            end_turn = int(seg.get("end_turn", -1))
+        except Exception:
+            end_turn = -1
+        max_end = max(max_end, end_turn)
+
+        seg_mems = seg.get("memories", []) or []
+        _L(f"→ 处理 seg(end_turn={end_turn})，memories={len(seg_mems)}")
+
+        for i, m in enumerate(seg_mems):
+            c = (m.get("content") or "").strip()
+            if not c:
+                _L(f"    ✂️ mem[{i}] content 为空，跳过")
+                continue
+            # importance
+            try:
+                p = float(m.get("importance", 0.0))
+            except Exception:
+                p = 0.0
+            p = max(0.0, min(1.0, p))
+
+            _L(f"    · mem[{i}] content='{c[:40]}{'...' if len(c)>40 else ''}', importance={p}")
+
+            # embedding
+            try:
+                raw_emb = embed_text(bgem3, f"passage:{c}")
+                if hasattr(raw_emb, "tolist"):   # numpy array 或 torch tensor
+                    emb = raw_emb.tolist()
+                else:
+                    emb = list(raw_emb) if raw_emb is not None else None
+                
+                if not emb:
+                    _L("      ⚠️ embedding 为空或 None")
+            except Exception as ee:
+                _L("      ❌ 计算 embedding 失败：", repr(ee))
+                _L(traceback.format_exc())
+                continue
+
+            # DB 插入
+            mu = MemoryUnit(content=c, importance=p, embedding=emb)
+            try:
+                store.add(mu)  # 确认这里的方法名/签名与 MemoryStore 一致
+                out_units.append(mu)
+                _L("      ✅ 入库成功。")
+            except Exception as de:
+                _L("      ❌ 入库失败：", repr(de))
+                _L(traceback.format_exc())
+                # 不中断整个流程，继续其他 mem
+
+    # 推进水位
+    if out_units:
+        try:
+            _L(f"推进水位：{wm} → {max_end}")
+            _set_watermark(max_end)
+        except Exception as we:
+            _L("⚠️ 设置水位失败：", repr(we))
+    else:
+        _L("⚠️ 本次没有任何记忆入库，水位不变：", wm)
+
+    _L("—— 结束：新增记忆条数 =", len(out_units))
+    return out_units
 
 
 # ================== 主聊天逻辑 ==================
 if prompt := st.chat_input("请输入"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    msgs, last_ts = get_latest_messages(
+    k=compute_adaptive_k(),
+    roles_for_idle=("user",),
+    return_last_ts=True,
+    )
+    last_ts = _ensure_float_ts(last_ts)
+    idle_seconds: float = 0.0 if last_ts is None else (time.time() - last_ts)
+
+    st.session_state.messages.append({"role": "user", "content": prompt, "ts": time.time()})
     st.session_state.to_generate = True
     st.session_state.turn_id = str(uuid.uuid4())
     with st.chat_message("user", avatar="👧🏻"):
@@ -301,26 +608,13 @@ if prompt := st.chat_input("请输入"):
                 f"provider={st.session_state.provider}, model={st.session_state.model_name}"
             )
             with st.spinner("正在生成回复..."):
-                k = int(st.session_state.get("recent_k", 0))
-                k = max(k, 0)
-
-                history = [
-                    m
-                    for m in st.session_state.messages
-                    if m.get("role") in ("user", "assistant")
-                ]
-
-                history_wo_current = (
-                    history[:-1]
-                    if history and history[-1].get("role") == "user"
-                    else history
-                )
-                recent_dialog = history_wo_current[-2 * k :] if k else []
-
+                k = 5 if st.session_state.recent_k >= 5 else st.session_state.recent_k
+                recent_dialog = cast(List[Dict[str, str]], get_latest_messages(k=k, return_last_ts=False) if k else [])
+                
                 assistant_response_stream = chat_with_memories(
                     provider=st.session_state.provider,
                     model=st.session_state.model_name,
-                    recent_dialog=recent_dialog,
+                    history=recent_dialog,
                     retrieved_memories=expanded_mems,
                     current_query=prompt,
                     stream=stream_mode,
@@ -330,81 +624,200 @@ if prompt := st.chat_input("请输入"):
                 full_text = st.write_stream(cleaned_stream)
 
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": full_text}
+                    {"role": "assistant", "content": full_text, "ts": time.time()}
                 )
 
-            # 3) 更新记忆
-            # 3.1 组织原始对话文本（只拿本轮：用户输入）
-            raw_for_memory = f"User: {prompt}"
 
-            # 3.2 调用提取器（DeepSeek），返回 MemoryUnit 列表（已自带 importance 与 embedding）
+            # 3) 提取记忆
+            MIN_IMPORTANCE = 0.30
+            store = st.session_state.memory_store
+
             try:
-                with st.spinner("正在从本轮对话中提取记忆…"):
-                    new_units = build_mu_from_raw(
-                        raw_for_memory
-                    )  # -> List[MemoryUnit]
-                    
+                # 触发条件
+                if idle_seconds >= 5 * 60:
+                    should, reason, new_count = True, "idle", 0
+                    st.info(f"✅ 触发批量抽取记忆: 超过5分钟未活跃, new_count={new_count}, idle_seconds={idle_seconds:.1f}s")
+                else:
+                    should, new_count = should_trigger_by_rounds()
+                    reason = "rounds" if should else "none"
+                    if should:
+                        st.info(f"✅ 触发批量抽取记忆: 新增消息数={new_count}, idle_seconds={idle_seconds:.1f}s")
+                    else:
+                        st.caption(f"未触发批量抽取记忆, 新增消息数={new_count}, idle_seconds={idle_seconds:.1f}s")
+                if not should:
+                    st.caption("未触发批量（新增消息数未达标或停滞时间不足）。")
+                    st.stop()
 
-            except Exception as e:
-                st.warning(f"记忆提取失败：{e}")
-                new_units = []
+                # 拼接对话块
+                msgs = st.session_state.messages
+                dialogue_block = "\n".join(
+                    f"{i}. ({m.get('role','')}) {m.get('content','')}" for i, m in enumerate(msgs)
+                )
 
-            # 3.3 重要性阈值过滤（可调），写入记忆库
-            MIN_IMPORTANCE = 0.3
-            added = 0
-            accepted: List[MemoryUnit] = []  # ⬅️ 新增
-            for mu in new_units:
+                # 切分+抽取
+                with st.spinner("批量处理：切分并提取（跳过最后话题）…"):
+                    result = call_llm_segment_and_extract(dialogue_block=dialogue_block, run_llm=run_llm)
+
+                # 调试概览
                 try:
-                    if any(m.content == mu.content for m in memory_store.get_all()):
-                        continue
-                    if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
-                        st.session_state.memory_system.add_memory(mu)
-                        accepted.append(mu)  # ⬅️ 新增
-                        added += 1
-                except Exception:
-                    st.error(f"写入数据库失败：{mu.content}")
-
-            # 3.3.1 本轮若有新增，则做事件归属（用已算好的 prompt_embedding）
-            if accepted:
-                try:
-                    assign_event_for_units(
-                        memory_store, prompt, prompt_embedding, accepted
-                    )  # ⬅️ 新增
+                    segs = (result or {}).get("segments", []) or []
+                    st.caption(f"[调试] LLM segments={len(segs)}（将忽略最后一段）")
+                    for i, s in enumerate(segs[:5]):
+                        ms = (s or {}).get("memories", []) or []
+                        st.caption(f"  seg[{i}]: end_turn={s.get('end_turn')}, memories={len(ms)}")
                 except Exception as e:
-                    st.warning(f"事件归属失败：{e}")
+                    st.warning(f"[调试] 打印 result 概览失败：{e}")
 
-            # 3.4 可选：给出本轮新增记忆的可视化
-            # 3.4 可视化：展示新增记忆的事件归属
-            if added:
-                with st.expander(
-                    f"🧠 本轮新增 {added} 条记忆（≥ {MIN_IMPORTANCE:.2f}）",
-                    expanded=False,
-                ):
-                    for mu in new_units:
-                        if getattr(mu, "importance", 0.0) >= MIN_IMPORTANCE:
-                            # 重新读取，拿到 event_id
-                            mu_fresh = memory_store.get(mu.id)
-                            if mu_fresh is None:
-                                continue
-                            st.info(
-                                f"- {mu_fresh.content}\n（importance={mu_fresh.importance:.2f}）"
-                            )
-                            if getattr(mu_fresh, "event_id", None):
-                                header, _ = memory_store.get_event_context(
-                                    mu_fresh.id, k_siblings=0
-                                )
+                # 仅收集“非最后段”的记忆；不上游入库，这里统一入库
+                raw_items = []
+                for s in segs[:-1]:
+                    mems = (s or {}).get("memories", []) or []
+                    raw_items.extend(mems)
+
+                # 统一转 MemoryUnit（就地写，不建小函数）
+                new_units = []
+                for x in raw_items:
+                    if isinstance(x, MemoryUnit):
+                        mu = x
+                    else:
+                        mu = MemoryUnit(
+                            content=(x.get("content", "") or "").strip(),
+                            importance=float(x.get("importance", 0.0) or 0.0),
+                        )
+                    new_units.append(mu)
+
+                # 读取库内内容用于去重（按 content）
+                try:
+                    existing_contents = {getattr(m, "content", None) for m in store.get_all()}
+                    existing_contents.discard(None)
+                except Exception:
+                    existing_contents = set()
+
+                # 重要性过滤 + 去重（库内 + 批内）
+                seen_in_batch, accepted = set(), []
+                for mu in new_units:
+                    try:
+                        c = (getattr(mu, "content", "") or "").strip()
+                        if not c:
+                            continue
+                        imp = float(getattr(mu, "importance", 0.0) or 0.0)
+                        if imp < MIN_IMPORTANCE:
+                            continue
+                        if c in existing_contents or c in seen_in_batch:
+                            continue
+                        accepted.append(mu)
+                        seen_in_batch.add(c)
+                    except Exception:
+                        st.error("处理单条记忆时出错")
+                        st.code(traceback.format_exc())
+
+                st.caption(f"[调试] 过滤后待入库条数={len(accepted)}（阈值≥{MIN_IMPORTANCE:.2f}）")
+                if accepted[:3]:
+                    st.caption(f"[调试] 预览前3条：{[mu.content for mu in accepted[:3]]}")
+
+
+
+                # ===（建议）仅当 accepted 非空时再算 embedding ===
+                if accepted:
+                    try:
+                        contents = [mu.content for mu in accepted]
+                        # 1) 批量计算
+                        embeddings = embed_text(bgem3, [f"passage:{c}" for c in contents])
+                        # 2) 断言条数一致（极端情况下保护）
+                        if len(embeddings) != len(accepted):
+                            st.warning(f"embedding 返回条数异常：expected={len(accepted)}, got={len(embeddings)}；将尝试逐条回退")
+                            # 逐条回退
+                            new_embs = []
+                            for mu in accepted:
+                                try:
+                                    e = embed_text(bgem3, f"passage:{mu.content}")
+                                    new_embs.append(e)
+                                except Exception:
+                                    new_embs.append(None)
+                            embeddings = new_embs
+
+                        # 3) 写回每条 mu.embedding
+                        for mu, emb in zip(accepted, embeddings):
+                            if emb is not None and hasattr(emb, "tolist"):
+                                mu.embedding = emb.tolist()
+                            else:
+                                mu.embedding = emb  # 可能是 None 或已是 list
+
+                    except Exception as e:
+                        st.warning(f"批量计算 embedding 失败：{e}。将逐条回退。")
+                        # fallback：逐条计算，尽量不丢
+                        for mu in accepted:
+                            try:
+                                emb = embed_text(bgem3, f"passage:{mu.content}")
+                                mu.embedding = emb.tolist() if hasattr(emb, "tolist") else emb
+                            except Exception:
+                                mu.embedding = None
+                                st.caption(f"⚠️ 单条 embedding 失败，content='{mu.content[:30]}…' 将以 None 入库")
+
+                # —— 入库（逐条 add）——
+                added_count = 0
+                for mu in accepted:
+                    try:
+                        r = store.add(mu)
+                        if getattr(mu, "id", None) is None:
+                            mu.id = r if isinstance(r, (str, int)) else getattr(r, "id", None)
+                        existing_contents.add(getattr(mu, "content", ""))
+                        added_count += 1
+                    except Exception:
+                        st.error(f"写入数据库失败：{getattr(mu, 'content', '')}")
+                        st.code(traceback.format_exc())
+
+                st.info(f"✅ 批量触发：reason={reason}, new_count={new_count}, 新增记忆={added_count}")
+
+                # —— 事件归属（仅对本轮 accepted）——
+                if accepted:
+                    try:
+                        assign_event_for_units(store, prompt, prompt_embedding, accepted)
+                    except Exception as e:
+                        st.warning(f"事件归属失败：{e}")
+
+
+                st.info(f"✅ 批量触发：reason={reason}, new_count={new_count}, 新增记忆={added_count}")
+
+
+
+                # 可视化（仅展示本轮 accepted）
+                if accepted:
+                    with st.expander(f"🧠 本轮新增 {len(accepted)} 条记忆（≥ {MIN_IMPORTANCE:.2f}）", expanded=False):
+                        for mu in accepted:
+                            mu_id = getattr(mu, "id", None)
+                            mu_fresh = None
+                            if mu_id:
+                                try:
+                                    mu_fresh = store.get(mu_id)
+                                except Exception:
+                                    mu_fresh = None
+                            mu_fresh = mu_fresh or mu
+
+                            st.info(f"- {getattr(mu_fresh, 'content', '')}\n（importance={getattr(mu_fresh, 'importance', 0.0):.2f}）")
+
+                            ev_id = getattr(mu_fresh, "event_id", None)
+                            if ev_id:
+                                try:
+                                    header, _ = store.get_event_context(mu_fresh.id, k_siblings=0)
+                                except Exception:
+                                    header = None
                                 title = (header or {}).get("title") or "未命名事件"
                                 status = (header or {}).get("status")
                                 start_ts = (header or {}).get("start_ts")
                                 updated_at = (header or {}).get("updated_at")
-                                st.caption(
-                                    f"事件ID：`{mu_fresh.event_id}`｜事件《{title}》｜状态：{status}｜"
-                                    f"时间窗：{start_ts} → {updated_at}"
-                                )
+                                st.caption(f"事件ID：`{ev_id}`｜事件《{title}》｜状态：{status}｜时间窗：{start_ts} → {updated_at}")
                             else:
                                 st.caption("（未绑定事件）")
-            else:
-                st.caption("本轮未新增记忆或重要性较低。")
+
+                # 推进“水位”
+                st.session_state["last_batch_msg_idx"] = len(msgs) - 1
+
+            except Exception as e:
+                st.warning(f"记忆批量处理失败：{e}")
+                st.code(traceback.format_exc())
+
+
 
     st.session_state.handled_turn_id = st.session_state.turn_id
     st.session_state.to_generate = False
@@ -425,7 +838,7 @@ with all_memories_view:
     # 按时间排序（若有 timestamp）
     def mem_ts(m):
         ts = getattr(m, "timestamp", None)
-        return ts if isinstance(ts, datetime.datetime) else datetime.datetime.min
+        return ts if isinstance(ts, datetime) else datetime.min
 
     all_mems_sorted = sorted(all_mems, key=mem_ts, reverse=True)
 
@@ -462,10 +875,10 @@ with all_memories_view:
             st.markdown(f"**ID:** `{getattr(mem, 'id', 'N/A')}`")
             st.markdown(f"**内容:** {mem.content}")
             ts = getattr(mem, "timestamp", None)
-            if isinstance(ts, datetime.datetime):
+            if isinstance(ts, datetime):
                 st.markdown(f"**创建时间:** {ts.strftime('%Y-%m-%d %H:%M:%S')}")
             count = getattr(mem, "retrieval_count", 0)
             st.markdown(f"**检索次数:** {count}")
             last_ts = getattr(mem, "last_retrieved_ts", None)
-            if isinstance(last_ts, datetime.datetime):
+            if isinstance(last_ts, datetime):
                 st.markdown(f"**上次检索:** {last_ts.strftime('%Y-%m-%d %H:%M:%S')}")
